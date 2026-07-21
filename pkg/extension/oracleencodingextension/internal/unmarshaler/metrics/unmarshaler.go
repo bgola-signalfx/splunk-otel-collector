@@ -99,18 +99,15 @@ func NewResourceMetricsUnmarshaler(logger *zap.Logger) ResourceMetricsUnmarshale
 
 // UnmarshalMetrics reads a JSONL-encoded payload of OCI metric records, one
 // per line, and converts it into an OpenTelemetry pmetric.Metrics object.
-// Records sharing the same compartment, namespace, resource group and
-// resource ID are grouped into a single ResourceMetrics.
 func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metrics, error) {
-	allResourceScopeMetrics := map[string]pmetric.ScopeMetrics{}
-	allResourceAttrs := map[string]map[string]string{}
+	allResourceMetrics := map[string]pmetric.ResourceMetrics{}
 
 	reader := bufio.NewReader(bytes.NewReader(buf))
 	for {
 		line, err := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
-			r.unmarshalRecord(allResourceScopeMetrics, allResourceAttrs, trimmed)
+			r.unmarshalRecord(allResourceMetrics, trimmed)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -121,20 +118,17 @@ func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metric
 	}
 
 	md := pmetric.NewMetrics()
-	for resourceKey, scopeMetrics := range allResourceScopeMetrics {
-		rm := md.ResourceMetrics().AppendEmpty()
-		for k, v := range allResourceAttrs[resourceKey] {
-			rm.Resource().Attributes().PutStr(k, v)
-		}
-		scopeMetrics.MoveTo(rm.ScopeMetrics().AppendEmpty())
+	for _, rm := range allResourceMetrics {
+		rm.MoveTo(md.ResourceMetrics().AppendEmpty())
 	}
 
 	return md, nil
 }
 
+// Records sharing the same compartment, namespace, resource group and
+// resource ID are grouped into a single ResourceMetrics.
 func (r ResourceMetricsUnmarshaler) unmarshalRecord(
-	allResourceScopeMetrics map[string]pmetric.ScopeMetrics,
-	allResourceAttrs map[string]map[string]string,
+	allResourceMetrics map[string]pmetric.ResourceMetrics,
 	jsonRecord []byte,
 ) {
 	rec, err := r.getValidRecord(jsonRecord)
@@ -156,14 +150,17 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 	resourceID := extractResourceID(rec.Dimensions)
 	resourceKey := rec.CompartmentID + "|" + rec.Namespace + "|" + rec.ResourceGroup + "|" + resourceID
 
-	scopeMetrics, found := allResourceScopeMetrics[resourceKey]
+	rm, found := allResourceMetrics[resourceKey]
 	if !found {
-		scopeMetrics = pmetric.NewScopeMetrics()
-		scopeMetrics.Scope().SetName(ScopeName)
-		allResourceScopeMetrics[resourceKey] = scopeMetrics
-		allResourceAttrs[resourceKey] = resourceAttributes(*rec, resourceID)
+		rm = pmetric.NewResourceMetrics()
+		for k, v := range resourceAttributes(*rec, resourceID) {
+			rm.Resource().Attributes().PutStr(k, v)
+		}
+		rm.ScopeMetrics().AppendEmpty().Scope().SetName(ScopeName)
+		allResourceMetrics[resourceKey] = rm
 	}
 
+	scopeMetrics := rm.ScopeMetrics().At(0)
 	m := scopeMetrics.Metrics().AppendEmpty()
 	m.SetName(rec.Name)
 	if rec.Metadata.Unit != "" {
