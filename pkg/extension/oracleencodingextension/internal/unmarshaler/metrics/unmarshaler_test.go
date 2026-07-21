@@ -139,6 +139,33 @@ func TestUnmarshalMetrics_MissingName(t *testing.T) {
 	require.Equal(t, 0, md.ResourceMetrics().Len())
 }
 
+func TestUnmarshalMetrics_NoDatapoints(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"m","datapoints":[]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 0, md.ResourceMetrics().Len())
+}
+
+// TestUnmarshalMetrics_SkipsResourceWithOnlyEmptyRecord guards against a
+// resource ending up with an empty ScopeMetrics when the first record seen
+// for it has no valid datapoints, but a later record for the same resource
+// does.
+func TestUnmarshalMetrics_SkipsResourceWithOnlyEmptyRecord(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"empty","datapoints":[]}
+{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"valid","datapoints":[{"timestamp":1673388760000,"value":42.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+
+	scopeMetrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0)
+	require.Equal(t, 1, scopeMetrics.Metrics().Len())
+	require.Equal(t, "valid", scopeMetrics.Metrics().At(0).Name())
+}
+
 func TestUnmarshalMetrics_Empty(t *testing.T) {
 	u := NewResourceMetricsUnmarshaler(zap.NewNop())
 	md, err := u.UnmarshalMetrics([]byte(""))

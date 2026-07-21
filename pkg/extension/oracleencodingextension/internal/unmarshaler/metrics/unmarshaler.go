@@ -122,12 +122,6 @@ func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metric
 
 	md := pmetric.NewMetrics()
 	for resourceKey, scopeMetrics := range allResourceScopeMetrics {
-		// Do not add empty ResourceMetrics. This can happen if none of the
-		// datapoints for a given resource could be parsed.
-		if scopeMetrics.Metrics().Len() == 0 {
-			continue
-		}
-
 		rm := md.ResourceMetrics().AppendEmpty()
 		for k, v := range allResourceAttrs[resourceKey] {
 			rm.Resource().Attributes().PutStr(k, v)
@@ -143,18 +137,19 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 	allResourceAttrs map[string]map[string]string,
 	jsonRecord []byte,
 ) {
-	var rec ociMetricRecord
-	if err := json.Unmarshal(jsonRecord, &rec); err != nil {
-		r.logger.Error("JSON unmarshal failed for OCI metric record", zap.Error(err))
+	rec, err := r.getValidRecord(jsonRecord)
+	if err != nil {
+		r.logger.Warn("Skipping invalid OCI metric record", zap.Error(err))
 		return
 	}
 
-	if rec.Name == "" {
-		r.logger.Warn(
-			"No name set on OCI metric record",
-			zap.String("namespace", rec.Namespace),
-			zap.String("compartmentId", rec.CompartmentID),
-		)
+	dataPoints := r.getDatapoints(rec)
+
+	if dataPoints.Len() == 0 {
+		r.logger.Warn("Skipping OCI metric record without valid datapoints",
+			zap.Any("name", rec.Name),
+			zap.Any("namespace", rec.Namespace),
+			zap.Any("datapoints", rec.Datapoints))
 		return
 	}
 
@@ -166,9 +161,40 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 		scopeMetrics = pmetric.NewScopeMetrics()
 		scopeMetrics.Scope().SetName(ScopeName)
 		allResourceScopeMetrics[resourceKey] = scopeMetrics
-		allResourceAttrs[resourceKey] = resourceAttributes(rec, resourceID)
+		allResourceAttrs[resourceKey] = resourceAttributes(*rec, resourceID)
 	}
 
+	m := scopeMetrics.Metrics().AppendEmpty()
+	m.SetName(rec.Name)
+	if rec.Metadata.Unit != "" {
+		m.SetUnit(rec.Metadata.Unit)
+	}
+	if rec.Metadata.DisplayName != "" {
+		m.SetDescription(rec.Metadata.DisplayName)
+	}
+
+	// OCI Monitoring does not report an explicit metric type, and
+	// metadata.unit is descriptive (e.g. "ms") so always use gauge.
+	dataPoints.MoveAndAppendTo(m.SetEmptyGauge().DataPoints())
+}
+
+func (r ResourceMetricsUnmarshaler) getValidRecord(jsonRecord []byte) (*ociMetricRecord, error) {
+	var rec ociMetricRecord
+	if err := json.Unmarshal(jsonRecord, &rec); err != nil {
+		return nil, fmt.Errorf("JSON unmarshal failed for OCI metric record: %w", err)
+	}
+
+	if rec.Name == "" {
+		return nil, fmt.Errorf(
+			"no name set on OCI metric record (namespace=%q, compartmentId=%q)",
+			rec.Namespace, rec.CompartmentID,
+		)
+	}
+
+	return &rec, nil
+}
+
+func (r ResourceMetricsUnmarshaler) getDatapoints(rec *ociMetricRecord) pmetric.NumberDataPointSlice {
 	dataPoints := pmetric.NewNumberDataPointSlice()
 	for _, point := range rec.Datapoints {
 		timestamp := time.UnixMilli(point.Timestamp)
@@ -186,27 +212,7 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 			}
 		}
 	}
-
-	// Skip metrics for which no datapoint could be parsed, so we don't
-	// report an empty metric.
-	if dataPoints.Len() == 0 {
-		return
-	}
-
-	m := scopeMetrics.Metrics().AppendEmpty()
-	m.SetName(rec.Name)
-	if rec.Metadata.Unit != "" {
-		m.SetUnit(rec.Metadata.Unit)
-	}
-	if rec.Metadata.DisplayName != "" {
-		m.SetDescription(rec.Metadata.DisplayName)
-	}
-
-	// OCI Monitoring does not report an explicit metric type, and
-	// metadata.unit is descriptive (e.g. "count") rather than a signal of
-	// temporality or additivity, so all datapoints are represented as a
-	// Gauge.
-	dataPoints.MoveAndAppendTo(m.SetEmptyGauge().DataPoints())
+	return dataPoints
 }
 
 // resourceAttributes maps an OCI metric record onto OpenTelemetry resource
