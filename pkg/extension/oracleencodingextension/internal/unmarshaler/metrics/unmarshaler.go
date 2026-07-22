@@ -86,6 +86,18 @@ type ociMetricDatapoint struct {
 	Value     float64 `json:"value"`
 }
 
+type resourceIdentity struct {
+	compartmentID string
+	namespace     string
+	resourceGroup string
+	resourceID    string
+}
+
+type metricIdentity struct {
+	resource resourceIdentity
+	name     string
+}
+
 // ResourceMetricsUnmarshaler unmarshals OCI Monitoring metrics, encoded as
 // JSONL, into pmetric.Metrics.
 type ResourceMetricsUnmarshaler struct {
@@ -100,14 +112,15 @@ func NewResourceMetricsUnmarshaler(logger *zap.Logger) ResourceMetricsUnmarshale
 // UnmarshalMetrics reads a JSONL-encoded payload of OCI metric records, one
 // per line, and converts it into an OpenTelemetry pmetric.Metrics object.
 func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metrics, error) {
-	allResourceMetrics := map[string]pmetric.ResourceMetrics{}
+	allResourceMetrics := map[resourceIdentity]pmetric.ResourceMetrics{}
+	allMetrics := map[metricIdentity]map[string]pmetric.Metric{}
 
 	reader := bufio.NewReader(bytes.NewReader(buf))
 	for {
 		line, err := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
-			r.unmarshalRecord(allResourceMetrics, trimmed)
+			r.unmarshalRecord(allResourceMetrics, allMetrics, trimmed)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -126,9 +139,12 @@ func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metric
 }
 
 // Records sharing the same compartment, namespace, resource group and
-// resource ID are grouped into a single ResourceMetrics.
+// resource ID are grouped into a single ResourceMetrics. Within a
+// ResourceMetrics, records sharing the same metric name and unit are merged
+// into a single Metric.
 func (r ResourceMetricsUnmarshaler) unmarshalRecord(
-	allResourceMetrics map[string]pmetric.ResourceMetrics,
+	allResourceMetrics map[resourceIdentity]pmetric.ResourceMetrics,
+	allMetrics map[metricIdentity]map[string]pmetric.Metric,
 	jsonRecord []byte,
 ) {
 	rec, err := r.getValidRecord(jsonRecord)
@@ -148,7 +164,12 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 	}
 
 	resourceID := extractResourceID(rec.Dimensions)
-	resourceKey := rec.CompartmentID + "|" + rec.Namespace + "|" + rec.ResourceGroup + "|" + resourceID
+	resourceKey := resourceIdentity{
+		compartmentID: rec.CompartmentID,
+		namespace:     rec.Namespace,
+		resourceGroup: rec.ResourceGroup,
+		resourceID:    resourceID,
+	}
 
 	rm, found := allResourceMetrics[resourceKey]
 	if !found {
@@ -160,19 +181,42 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 		allResourceMetrics[resourceKey] = rm
 	}
 
-	scopeMetrics := rm.ScopeMetrics().At(0)
-	m := scopeMetrics.Metrics().AppendEmpty()
-	m.SetName(rec.Name)
-	if rec.Metadata.Unit != "" {
-		m.SetUnit(rec.Metadata.Unit)
+	metricKey := metricIdentity{resource: resourceKey, name: rec.Name}
+	metricsByUnit, found := allMetrics[metricKey]
+	if !found {
+		metricsByUnit = map[string]pmetric.Metric{}
+		allMetrics[metricKey] = metricsByUnit
 	}
-	if rec.Metadata.DisplayName != "" {
+
+	m, found := metricsByUnit[rec.Metadata.Unit]
+	if !found {
+		if len(metricsByUnit) > 0 {
+			r.logger.Warn(
+				"Conflicting units for OCI metric records",
+				zap.String("name", rec.Name),
+				zap.String("namespace", rec.Namespace),
+				zap.String("unit", rec.Metadata.Unit),
+			)
+		}
+
+		m = rm.ScopeMetrics().At(0).Metrics().AppendEmpty()
+		m.SetName(rec.Name)
+		if rec.Metadata.Unit != "" {
+			m.SetUnit(rec.Metadata.Unit)
+		}
+		// OCI Monitoring does not report an explicit metric type, and
+		// metadata.unit is descriptive (e.g. "ms") so always use gauge.
+		m.SetEmptyGauge()
+		metricsByUnit[rec.Metadata.Unit] = m
+	}
+
+	// Description is not identifying. Prefer the longer description when
+	// repeated records disagree, following the OTel producer recommendation.
+	if len(rec.Metadata.DisplayName) > len(m.Description()) {
 		m.SetDescription(rec.Metadata.DisplayName)
 	}
 
-	// OCI Monitoring does not report an explicit metric type, and
-	// metadata.unit is descriptive (e.g. "ms") so always use gauge.
-	dataPoints.MoveAndAppendTo(m.SetEmptyGauge().DataPoints())
+	dataPoints.MoveAndAppendTo(m.Gauge().DataPoints())
 }
 
 func (r ResourceMetricsUnmarshaler) getValidRecord(jsonRecord []byte) (*ociMetricRecord, error) {

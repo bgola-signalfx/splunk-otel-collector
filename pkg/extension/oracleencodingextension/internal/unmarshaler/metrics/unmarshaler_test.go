@@ -148,10 +148,6 @@ func TestUnmarshalMetrics_NoDatapoints(t *testing.T) {
 	require.Equal(t, 0, md.ResourceMetrics().Len())
 }
 
-// TestUnmarshalMetrics_SkipsResourceWithOnlyEmptyRecord guards against a
-// resource ending up with an empty ScopeMetrics when the first record seen
-// for it has no valid datapoints, but a later record for the same resource
-// does.
 func TestUnmarshalMetrics_SkipsResourceWithOnlyEmptyRecord(t *testing.T) {
 	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"empty","datapoints":[]}
 {"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"valid","datapoints":[{"timestamp":1673388760000,"value":42.0}]}
@@ -164,6 +160,54 @@ func TestUnmarshalMetrics_SkipsResourceWithOnlyEmptyRecord(t *testing.T) {
 	scopeMetrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0)
 	require.Equal(t, 1, scopeMetrics.Metrics().Len())
 	require.Equal(t, "valid", scopeMetrics.Metrics().At(0).Name())
+}
+
+func TestUnmarshalMetrics_MergesSameMetricIdentity(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"successRate","dimensions":{"appName":"myAppA"},"metadata":{"unit":"percent","displayName":"Success rate"},"datapoints":[{"timestamp":1673388760000,"value":83.0}]}
+{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"successRate","dimensions":{"appName":"myAppB"},"metadata":{"unit":"percent","displayName":"Application success rate"},"datapoints":[{"timestamp":1673388761000,"value":90.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+
+	scopeMetrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0)
+	require.Equal(t, 1, scopeMetrics.Metrics().Len())
+
+	m := scopeMetrics.Metrics().At(0)
+	require.Equal(t, "successRate", m.Name())
+	require.Equal(t, "percent", m.Unit())
+	require.Equal(t, "Application success rate", m.Description())
+	require.Equal(t, 2, m.Gauge().DataPoints().Len())
+
+	appName0, ok := m.Gauge().DataPoints().At(0).Attributes().Get("appName")
+	require.True(t, ok)
+	require.Equal(t, "myAppA", appName0.AsString())
+	appName1, ok := m.Gauge().DataPoints().At(1).Attributes().Get("appName")
+	require.True(t, ok)
+	require.Equal(t, "myAppB", appName1.AsString())
+}
+
+func TestUnmarshalMetrics_DoesNotMergeConflictingUnits(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"ms"},"datapoints":[{"timestamp":1673388760000,"value":42.0}]}
+{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"s"},"datapoints":[{"timestamp":1673388761000,"value":0.043}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+
+	metrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	require.Equal(t, 2, metrics.Len())
+
+	metricsByUnit := make(map[string]pmetric.Metric, metrics.Len())
+	for i := 0; i < metrics.Len(); i++ {
+		metricsByUnit[metrics.At(i).Unit()] = metrics.At(i)
+	}
+	require.Contains(t, metricsByUnit, "ms")
+	require.Contains(t, metricsByUnit, "s")
+	require.Equal(t, 42.0, metricsByUnit["ms"].Gauge().DataPoints().At(0).DoubleValue())
+	require.Equal(t, 0.043, metricsByUnit["s"].Gauge().DataPoints().At(0).DoubleValue())
 }
 
 func TestUnmarshalMetrics_Empty(t *testing.T) {
