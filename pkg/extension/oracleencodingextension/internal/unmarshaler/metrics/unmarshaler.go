@@ -112,15 +112,14 @@ func NewResourceMetricsUnmarshaler(logger *zap.Logger) ResourceMetricsUnmarshale
 // UnmarshalMetrics reads a JSONL-encoded payload of OCI metric records, one
 // per line, and converts it into an OpenTelemetry pmetric.Metrics object.
 func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metrics, error) {
-	allResourceMetrics := map[resourceIdentity]pmetric.ResourceMetrics{}
-	allMetrics := map[metricIdentity]map[string]pmetric.Metric{}
+	b := newMetricsBuilder(r.logger)
 
 	reader := bufio.NewReader(bytes.NewReader(buf))
 	for {
 		line, err := reader.ReadBytes('\n')
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) > 0 {
-			r.unmarshalRecord(allResourceMetrics, allMetrics, trimmed)
+			b.unmarshalRecord(trimmed)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -130,33 +129,42 @@ func (r ResourceMetricsUnmarshaler) UnmarshalMetrics(buf []byte) (pmetric.Metric
 		}
 	}
 
-	md := pmetric.NewMetrics()
-	for _, rm := range allResourceMetrics {
-		rm.MoveTo(md.ResourceMetrics().AppendEmpty())
-	}
-
-	return md, nil
+	return b.build(), nil
 }
 
-// Records sharing the same compartment, namespace, resource group and
-// resource ID are grouped into a single ResourceMetrics. Within a
-// ResourceMetrics, records sharing the same metric name and unit are merged
-// into a single Metric.
-func (r ResourceMetricsUnmarshaler) unmarshalRecord(
-	allResourceMetrics map[resourceIdentity]pmetric.ResourceMetrics,
-	allMetrics map[metricIdentity]map[string]pmetric.Metric,
-	jsonRecord []byte,
-) {
-	rec, err := r.getValidRecord(jsonRecord)
+// metricsBuilder accumulates OCI metric records into pmetric.Metrics,
+// grouping and merging them as records are added via unmarshalRecord.
+type metricsBuilder struct {
+	logger *zap.Logger
+
+	allResourceMetrics map[resourceIdentity]pmetric.ResourceMetrics
+	allMetrics         map[metricIdentity]map[string]pmetric.Metric
+}
+
+func newMetricsBuilder(logger *zap.Logger) *metricsBuilder {
+	return &metricsBuilder{
+		logger:             logger,
+		allResourceMetrics: map[resourceIdentity]pmetric.ResourceMetrics{},
+		allMetrics:         map[metricIdentity]map[string]pmetric.Metric{},
+	}
+}
+
+// unmarshalRecord parses a single JSON OCI metric record and merges
+// it into the builder's accumulated state. Records sharing the same
+// compartment, namespace, resource group and resource ID are grouped into a
+// single ResourceMetrics. Within a ResourceMetrics, records sharing the same
+// metric name and unit are merged into a single Metric.
+func (b *metricsBuilder) unmarshalRecord(jsonRecord []byte) {
+	rec, err := b.getValidRecord(jsonRecord)
 	if err != nil {
-		r.logger.Warn("Skipping invalid OCI metric record", zap.Error(err))
+		b.logger.Warn("Skipping invalid OCI metric record", zap.Error(err))
 		return
 	}
 
-	dataPoints := r.getDatapoints(rec)
+	dataPoints := b.getDatapoints(rec)
 
 	if dataPoints.Len() == 0 {
-		r.logger.Warn("Skipping OCI metric record without valid datapoints",
+		b.logger.Warn("Skipping OCI metric record without valid datapoints",
 			zap.Any("name", rec.Name),
 			zap.Any("namespace", rec.Namespace),
 			zap.Any("datapoints", rec.Datapoints))
@@ -171,27 +179,27 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 		resourceID:    resourceID,
 	}
 
-	rm, found := allResourceMetrics[resourceKey]
+	rm, found := b.allResourceMetrics[resourceKey]
 	if !found {
 		rm = pmetric.NewResourceMetrics()
 		for k, v := range resourceAttributes(*rec, resourceID) {
 			rm.Resource().Attributes().PutStr(k, v)
 		}
 		rm.ScopeMetrics().AppendEmpty().Scope().SetName(ScopeName)
-		allResourceMetrics[resourceKey] = rm
+		b.allResourceMetrics[resourceKey] = rm
 	}
 
 	metricKey := metricIdentity{resource: resourceKey, name: rec.Name}
-	metricsByUnit, found := allMetrics[metricKey]
+	metricsByUnit, found := b.allMetrics[metricKey]
 	if !found {
 		metricsByUnit = map[string]pmetric.Metric{}
-		allMetrics[metricKey] = metricsByUnit
+		b.allMetrics[metricKey] = metricsByUnit
 	}
 
 	m, found := metricsByUnit[rec.Metadata.Unit]
 	if !found {
 		if len(metricsByUnit) > 0 {
-			r.logger.Warn(
+			b.logger.Warn(
 				"Conflicting units for OCI metric records",
 				zap.String("name", rec.Name),
 				zap.String("namespace", rec.Namespace),
@@ -219,7 +227,16 @@ func (r ResourceMetricsUnmarshaler) unmarshalRecord(
 	dataPoints.MoveAndAppendTo(m.Gauge().DataPoints())
 }
 
-func (r ResourceMetricsUnmarshaler) getValidRecord(jsonRecord []byte) (*ociMetricRecord, error) {
+// build returns the accumulated ResourceMetrics as a pmetric.Metrics.
+func (b *metricsBuilder) build() pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	for _, rm := range b.allResourceMetrics {
+		rm.MoveTo(md.ResourceMetrics().AppendEmpty())
+	}
+	return md
+}
+
+func (b *metricsBuilder) getValidRecord(jsonRecord []byte) (*ociMetricRecord, error) {
 	var rec ociMetricRecord
 	if err := json.Unmarshal(jsonRecord, &rec); err != nil {
 		return nil, fmt.Errorf("JSON unmarshal failed for OCI metric record: %w", err)
@@ -235,7 +252,7 @@ func (r ResourceMetricsUnmarshaler) getValidRecord(jsonRecord []byte) (*ociMetri
 	return &rec, nil
 }
 
-func (r ResourceMetricsUnmarshaler) getDatapoints(rec *ociMetricRecord) pmetric.NumberDataPointSlice {
+func (b *metricsBuilder) getDatapoints(rec *ociMetricRecord) pmetric.NumberDataPointSlice {
 	dataPoints := pmetric.NewNumberDataPointSlice()
 	for _, point := range rec.Datapoints {
 		timestamp := time.UnixMilli(point.Timestamp)
@@ -245,7 +262,7 @@ func (r ResourceMetricsUnmarshaler) getDatapoints(rec *ociMetricRecord) pmetric.
 		dp.SetDoubleValue(point.Value)
 		if len(rec.Dimensions) > 0 {
 			if err := dp.Attributes().FromRaw(rec.Dimensions); err != nil {
-				r.logger.Warn(
+				b.logger.Warn(
 					"Failed to set attributes from dimensions",
 					zap.Any("dimensions", rec.Dimensions),
 					zap.Error(err),
