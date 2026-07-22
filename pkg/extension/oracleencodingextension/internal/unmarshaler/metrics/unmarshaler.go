@@ -227,8 +227,17 @@ func (b *metricsBuilder) unmarshalRecord(jsonRecord []byte) {
 	dataPoints.MoveAndAppendTo(m.Gauge().DataPoints())
 }
 
-// build returns the accumulated ResourceMetrics as a pmetric.Metrics.
+// build returns the accumulated ResourceMetrics as a pmetric.Metrics, with
+// each metric's datapoints sorted by timestamp, oldest first.
 func (b *metricsBuilder) build() pmetric.Metrics {
+	for _, metricsByUnit := range b.allMetrics {
+		for _, m := range metricsByUnit {
+			m.Gauge().DataPoints().Sort(func(a, b pmetric.NumberDataPoint) bool {
+				return a.Timestamp() < b.Timestamp()
+			})
+		}
+	}
+
 	md := pmetric.NewMetrics()
 	for _, rm := range b.allResourceMetrics {
 		rm.MoveTo(md.ResourceMetrics().AppendEmpty())

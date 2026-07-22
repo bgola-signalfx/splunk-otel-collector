@@ -188,6 +188,29 @@ func TestUnmarshalMetrics_MergesSameMetricIdentity(t *testing.T) {
 	require.Equal(t, "myAppB", appName1.AsString())
 }
 
+func TestUnmarshalMetrics_SortsDatapointsByTimestampAscending(t *testing.T) {
+	// Datapoints are out of order both within a single record and across
+	// separate records merged into the same metric.
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"ms"},"datapoints":[{"timestamp":1673388762000,"value":3.0},{"timestamp":1673388760000,"value":1.0}]}
+{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"ms"},"datapoints":[{"timestamp":1673388761000,"value":2.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+
+	m := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+	dps := m.Gauge().DataPoints()
+	require.Equal(t, 3, dps.Len())
+
+	require.Equal(t, pcommon.NewTimestampFromTime(time.UnixMilli(1673388760000)), dps.At(0).Timestamp())
+	require.Equal(t, 1.0, dps.At(0).DoubleValue())
+	require.Equal(t, pcommon.NewTimestampFromTime(time.UnixMilli(1673388761000)), dps.At(1).Timestamp())
+	require.Equal(t, 2.0, dps.At(1).DoubleValue())
+	require.Equal(t, pcommon.NewTimestampFromTime(time.UnixMilli(1673388762000)), dps.At(2).Timestamp())
+	require.Equal(t, 3.0, dps.At(2).DoubleValue())
+}
+
 func TestUnmarshalMetrics_DoesNotMergeConflictingUnits(t *testing.T) {
 	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"ms"},"datapoints":[{"timestamp":1673388760000,"value":42.0}]}
 {"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"latency","metadata":{"unit":"s"},"datapoints":[{"timestamp":1673388761000,"value":0.043}]}
