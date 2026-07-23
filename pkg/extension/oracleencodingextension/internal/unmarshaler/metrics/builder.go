@@ -150,12 +150,35 @@ func (b *metricsBuilder) getValidRecord(jsonRecord []byte) (*ociMetricRecord, er
 		)
 	}
 
+	if rec.CompartmentID == "" {
+		return nil, fmt.Errorf(
+			"no compartmentId set on OCI metric record (namespace=%q, name=%q)",
+			rec.Namespace, rec.Name,
+		)
+	}
+
+	if rec.Namespace == "" {
+		return nil, fmt.Errorf(
+			"no namespace set on OCI metric record (compartmentId=%q, name=%q)",
+			rec.CompartmentID, rec.Name,
+		)
+	}
+
 	return &rec, nil
 }
 
 func (b *metricsBuilder) getDatapoints(rec *ociMetricRecord) pmetric.NumberDataPointSlice {
 	dataPoints := pmetric.NewNumberDataPointSlice()
 	for _, point := range rec.Datapoints {
+		if point.Timestamp == 0 {
+			b.logger.Warn(
+				"Skipping OCI metric datapoint with zero timestamp",
+				zap.String("name", rec.Name),
+				zap.String("namespace", rec.Namespace),
+			)
+			continue
+		}
+
 		timestamp := time.UnixMilli(point.Timestamp)
 
 		dp := dataPoints.AppendEmpty()

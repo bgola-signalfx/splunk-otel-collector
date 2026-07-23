@@ -122,6 +122,28 @@ func TestUnmarshalMetrics_InvalidTimestamp(t *testing.T) {
 	require.Equal(t, 0, md.ResourceMetrics().Len())
 }
 
+func TestUnmarshalMetrics_SkipsZeroTimestampDatapoint(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"m","datapoints":[{"timestamp":0,"value":1.0},{"timestamp":1673388760000,"value":2.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 1, md.ResourceMetrics().Len())
+
+	dps := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints()
+	require.Equal(t, 1, dps.Len())
+	require.Equal(t, 2.0, dps.At(0).DoubleValue())
+}
+
+func TestUnmarshalMetrics_SkipsRecordWithOnlyZeroTimestampDatapoints(t *testing.T) {
+	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","name":"m","datapoints":[{"timestamp":0,"value":1.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 0, md.ResourceMetrics().Len())
+}
+
 func TestUnmarshalMetrics_InvalidJSON(t *testing.T) {
 	input := "not json\n"
 	u := NewResourceMetricsUnmarshaler(zap.NewNop())
@@ -132,6 +154,24 @@ func TestUnmarshalMetrics_InvalidJSON(t *testing.T) {
 
 func TestUnmarshalMetrics_MissingName(t *testing.T) {
 	input := `{"namespace":"ns","compartmentId":"c1","resourceGroup":"rg","datapoints":[{"timestamp":"2023-01-10T22:19:20Z","value":1.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 0, md.ResourceMetrics().Len())
+}
+
+func TestUnmarshalMetrics_MissingCompartmentID(t *testing.T) {
+	input := `{"namespace":"ns","resourceGroup":"rg","name":"m","datapoints":[{"timestamp":"2023-01-10T22:19:20Z","value":1.0}]}
+`
+	u := NewResourceMetricsUnmarshaler(zap.NewNop())
+	md, err := u.UnmarshalMetrics([]byte(input))
+	require.NoError(t, err)
+	require.Equal(t, 0, md.ResourceMetrics().Len())
+}
+
+func TestUnmarshalMetrics_MissingNamespace(t *testing.T) {
+	input := `{"compartmentId":"c1","resourceGroup":"rg","name":"m","datapoints":[{"timestamp":"2023-01-10T22:19:20Z","value":1.0}]}
 `
 	u := NewResourceMetricsUnmarshaler(zap.NewNop())
 	md, err := u.UnmarshalMetrics([]byte(input))
