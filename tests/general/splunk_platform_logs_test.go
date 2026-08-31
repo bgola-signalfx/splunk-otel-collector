@@ -179,6 +179,7 @@ func TestSplunkPlatformLogsWithO11yEffectiveConfig(t *testing.T) {
 		"health_check",
 		"http_forwarder",
 		"http_forwarder/opamp_splunk_o11y",
+		"opamp/splunk_o11y",
 		"zpages",
 		"config_source_telemetry",
 		"file_storage/filelogs",
@@ -208,6 +209,14 @@ func TestSplunkPlatformLogsWithO11yEffectiveConfig(t *testing.T) {
 		"resource_detection": map[string]any{
 			"detectors": []any{"gcp", "ecs", "ec2", "azure", "system"},
 			"override":  true,
+		},
+		"transform/limit_histogram_buckets": map[string]any{
+			"metric_statements": []any{
+				map[string]any{
+					"context":    "datapoint",
+					"statements": []any{`merge_histogram_buckets(32, method="limit_buckets")`},
+				},
+			},
 		},
 	}, processors)
 }
